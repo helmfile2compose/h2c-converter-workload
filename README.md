@@ -2,7 +2,7 @@
 
 Workload converter for [helmfile2compose](https://github.com/helmfile2compose/helmfile2compose) — converts Deployment, StatefulSet, DaemonSet, and Job manifests into compose services.
 
-**The Builder** — one of the Seven Bishops, the founding extensions of the helmfile2compose distribution.
+**The Builder** — one of the Eight Monks, the founding extensions of the helmfile2compose distribution.
 
 > Heresy level: 7/10 — flattens an entire orchestration plane into flat services. The most dangerous rite in the canon.
 
