@@ -3,7 +3,7 @@
 
 import fnmatch
 
-from h2c import (
+from h2c import (  # pylint: disable=import-error  # h2c resolves at runtime
     ConvertContext, ProviderResult, Provider,
     resolve_env, _convert_command,
     _convert_volume_mounts,
@@ -103,7 +103,7 @@ def _convert_sidecar_containers(pod_spec: dict, name: str, ctx: ConvertContext,
     return result
 
 
-class SimpleWorkloadProvider(Provider):
+class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-methods  # contract: one class, one method
     """Convert DaemonSet, Deployment, Job, StatefulSet manifests to compose services."""
     name = "simple-workload"
     kinds = list(_WORKLOAD_KINDS)
