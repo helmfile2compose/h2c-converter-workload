@@ -3,7 +3,7 @@
 
 import fnmatch
 
-from h2c import (  # pylint: disable=import-error  # h2c resolves at runtime
+from dekube import (  # pylint: disable=import-error  # h2c resolves at runtime
     ConvertContext, ProviderResult, Provider,
     resolve_env, _convert_command,
     _convert_volume_mounts,
