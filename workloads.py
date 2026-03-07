@@ -5,9 +5,9 @@ import fnmatch
 
 from dekube import (  # pylint: disable=import-error  # h2c resolves at runtime
     ConvertContext, ProviderResult, Provider,
-    resolve_env, _convert_command,
-    _convert_volume_mounts,
-    _resolve_named_port,
+    resolve_env, convert_command,
+    convert_volume_mounts,
+    resolve_named_port,
 )
 
 _WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "StatefulSet")
@@ -32,10 +32,10 @@ def _get_exposed_ports(workload_labels: dict, container_ports: list,
                 for sp in svc_info.get("ports") or []:
                     target = sp.get("targetPort", sp.get("port"))
                     if isinstance(target, str):
-                        target = _resolve_named_port(target, container_ports)
+                        target = resolve_named_port(target, container_ports)
                     node_port = sp.get("nodePort", sp.get("port"))
                     if isinstance(node_port, str):
-                        node_port = _resolve_named_port(node_port, container_ports)
+                        node_port = resolve_named_port(node_port, container_ports)
                     ports.append(f"{node_port}:{target}")
     return ports
 
@@ -52,10 +52,10 @@ def _build_aux_service(container: dict, pod_spec: dict, label: str,
                            service_port_map=ctx.service_port_map)
     env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
                 for e in env_list}
-    svc.update(_convert_command(container, env_dict))
+    svc.update(convert_command(container, env_dict))
     if env_dict:
         svc["environment"] = env_dict
-    volumes = _convert_volume_mounts(
+    volumes = convert_volume_mounts(
         container.get("volumeMounts") or [], pod_spec.get("volumes") or [],
         ctx.pvc_names, ctx.config, label, ctx.warnings,
         configmaps=ctx.configmaps, secrets=ctx.secrets,
@@ -175,7 +175,7 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
         env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
                     for e in env_list}
 
-        svc.update(_convert_command(container, env_dict))
+        svc.update(convert_command(container, env_dict))
         if env_dict:
             svc["environment"] = env_dict
 
@@ -187,7 +187,7 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
             svc["ports"] = exposed_ports
 
         # Volumes
-        svc_volumes = _convert_volume_mounts(
+        svc_volumes = convert_volume_mounts(
             container.get("volumeMounts") or [], pod_spec.get("volumes") or [],
             ctx.pvc_names, ctx.config, full, ctx.warnings,
             configmaps=ctx.configmaps, secrets=ctx.secrets,
