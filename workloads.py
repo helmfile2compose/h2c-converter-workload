@@ -2,6 +2,7 @@
 # pylint: disable=too-many-locals
 
 import fnmatch
+import shlex
 
 from dekube import (  # pylint: disable=import-error  # h2c resolves at runtime
     ConvertContext, ProviderResult, Provider,
@@ -11,6 +12,49 @@ from dekube import (  # pylint: disable=import-error  # h2c resolves at runtime
 )
 
 _WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "StatefulSet")
+
+
+def _probe_to_healthcheck(probe: dict) -> dict | None:
+    """Convert a K8s probe to a Compose healthcheck dict."""
+    if not probe:
+        return None
+    hc = {}
+    if "exec" in probe:
+        cmd = (probe["exec"].get("command") or [])
+        if cmd:
+            hc["test"] = ["CMD"] + cmd
+    elif "httpGet" in probe:
+        http = probe["httpGet"]
+        port = http.get("port", 80)
+        path = http.get("path", "/")
+        scheme = http.get("scheme", "HTTP").lower()
+        host = http.get("host", "localhost")
+        url = shlex.quote(f"{scheme}://{host}:{port}{path}")
+        hc["test"] = ["CMD", "sh", "-c",
+                       f"wget -qO /dev/null {url} || exit 1"]
+    elif "tcpSocket" in probe:
+        port = int(probe["tcpSocket"].get("port", 80))
+        hc["test"] = ["CMD", "sh", "-c",
+                       f"cat < /dev/tcp/localhost/{port} || exit 1"]
+    else:
+        return None
+    if "periodSeconds" in probe:
+        hc["interval"] = f"{probe['periodSeconds']}s"
+    if "timeoutSeconds" in probe:
+        hc["timeout"] = f"{probe['timeoutSeconds']}s"
+    if "failureThreshold" in probe:
+        hc["retries"] = probe["failureThreshold"]
+    if "initialDelaySeconds" in probe:
+        hc["start_period"] = f"{probe['initialDelaySeconds']}s"
+    return hc
+
+
+def _k8s_cpu_to_compose(cpu: str) -> str:
+    """Convert K8s CPU quantity (e.g. '500m', '1', '0.5') to Compose cpus float string."""
+    cpu = str(cpu)
+    if cpu.endswith("m"):
+        return f"{int(cpu[:-1]) / 1000:.3g}"
+    return cpu
 
 
 def _is_excluded(name: str, exclude_list: list[str]) -> bool:
@@ -146,6 +190,10 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
         result = _convert_init_containers(pod_spec, name, ctx, vcts=vcts)
         svc = self._build_service(containers[0], pod_spec, meta, full,
                                   ctx, restart_policy, vcts)
+        init_names = [k for k in result]
+        if init_names:
+            svc.setdefault("depends_on", {}).update(
+                {n: {"condition": "service_completed_successfully"} for n in init_names})
         result[name] = svc
 
         if len(containers) > 1:
@@ -199,8 +247,19 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
         if svc_volumes:
             svc["volumes"] = svc_volumes
 
-        resources = container.get("resources", {})
-        if resources.get("limits") or resources.get("requests"):
-            ctx.warnings.append(f"resource limits on {full} ignored")
+        # Healthcheck from probes (readiness preferred, fallback to liveness)
+        probe = container.get("readinessProbe") or container.get("livenessProbe")
+        hc = _probe_to_healthcheck(probe)
+        if hc:
+            svc["healthcheck"] = hc
+
+        limits = (container.get("resources") or {}).get("limits") or {}
+        deploy_limits = {}
+        if "memory" in limits:
+            deploy_limits["memory"] = limits["memory"]
+        if "cpu" in limits:
+            deploy_limits["cpus"] = _k8s_cpu_to_compose(limits["cpu"])
+        if deploy_limits:
+            svc["deploy"] = {"resources": {"limits": deploy_limits}}
 
         return svc
