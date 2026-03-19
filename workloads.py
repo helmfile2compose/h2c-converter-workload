@@ -61,6 +61,16 @@ def _k8s_cpu_to_compose(cpu: str) -> str:
     return cpu
 
 
+def _k8s_mem_to_compose(mem: str) -> str:
+    """Convert K8s memory quantity (e.g. '256Mi', '1Gi') to Compose format ('256m', '1g')."""
+    mem = str(mem)
+    # K8s binary units → Compose lowercase (Ki→k, Mi→m, Gi→g, Ti→t)
+    for suffix in ("Ti", "Gi", "Mi", "Ki"):
+        if mem.endswith(suffix):
+            return mem[:-2] + suffix[0].lower()
+    return mem
+
+
 def _is_excluded(name: str, exclude_list: list[str]) -> bool:
     """Check if a workload name matches any exclude pattern (supports wildcards)."""
     return any(fnmatch.fnmatch(name, pattern) for pattern in exclude_list)
@@ -260,7 +270,7 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
         limits = (container.get("resources") or {}).get("limits") or {}
         deploy_limits = {}
         if "memory" in limits:
-            deploy_limits["memory"] = limits["memory"]
+            deploy_limits["memory"] = _k8s_mem_to_compose(limits["memory"])
         if "cpu" in limits:
             deploy_limits["cpus"] = _k8s_cpu_to_compose(limits["cpu"])
         if deploy_limits:
