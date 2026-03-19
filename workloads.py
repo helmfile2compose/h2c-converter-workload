@@ -14,158 +14,159 @@ from dekube import (  # pylint: disable=import-error  # h2c resolves at runtime
 _WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "Pod", "StatefulSet")
 
 
-def _probe_to_healthcheck(probe: dict, container_ports: list | None = None) -> dict | None:
-    """Convert a K8s probe to a Compose healthcheck dict."""
-    if not probe:
-        return None
-    hc = {}
-    if "exec" in probe:
-        cmd = (probe["exec"].get("command") or [])
-        if cmd:
-            hc["test"] = ["CMD"] + cmd
-    elif "httpGet" in probe:
-        http = probe["httpGet"]
-        port = http.get("port", 80)
-        if isinstance(port, str):
-            port = resolve_named_port(port, container_ports or [])
-        path = http.get("path", "/")
-        scheme = http.get("scheme", "HTTP").lower()
-        host = http.get("host", "localhost")
-        url = shlex.quote(f"{scheme}://{host}:{port}{path}")
-        hc["test"] = ["CMD", "sh", "-c",
-                       f"wget -qO /dev/null {url} || exit 1"]
-    elif "tcpSocket" in probe:
-        port = probe["tcpSocket"].get("port", 80)
-        if isinstance(port, str):
-            port = resolve_named_port(port, container_ports or [])
-        hc["test"] = ["CMD", "sh", "-c",
-                       f"cat < /dev/tcp/localhost/{port} || exit 1"]
-    else:
-        return None
-    if "periodSeconds" in probe:
-        hc["interval"] = f"{probe['periodSeconds']}s"
-    if "timeoutSeconds" in probe:
-        hc["timeout"] = f"{probe['timeoutSeconds']}s"
-    if "failureThreshold" in probe:
-        hc["retries"] = probe["failureThreshold"]
-    if "initialDelaySeconds" in probe:
-        hc["start_period"] = f"{probe['initialDelaySeconds']}s"
-    return hc
-
-
-def _k8s_cpu_to_compose(cpu: str) -> str:
-    """Convert K8s CPU quantity (e.g. '500m', '1', '0.5') to Compose cpus float string."""
-    cpu = str(cpu)
-    if cpu.endswith("m"):
-        return f"{int(cpu[:-1]) / 1000:.3g}"
-    return cpu
-
-
-def _k8s_mem_to_compose(mem: str) -> str:
-    """Convert K8s memory quantity (e.g. '256Mi', '1Gi') to Compose format ('256m', '1g')."""
-    mem = str(mem)
-    # K8s binary units → Compose lowercase (Ki→k, Mi→m, Gi→g, Ti→t)
-    for suffix in ("Ti", "Gi", "Mi", "Ki"):
-        if mem.endswith(suffix):
-            return mem[:-2] + suffix[0].lower()
-    return mem
-
-
-def _is_excluded(name: str, exclude_list: list[str]) -> bool:
-    """Check if a workload name matches any exclude pattern (supports wildcards)."""
-    return any(fnmatch.fnmatch(name, pattern) for pattern in exclude_list)
-
-
-def _get_exposed_ports(workload_labels: dict, container_ports: list,
-                       services_by_selector: dict) -> list[str]:
-    """Determine which ports to expose based on K8s Service type."""
-    ports = []
-    for _sel_key, svc_info in services_by_selector.items():
-        svc_labels = svc_info.get("selector") or {}
-        if not svc_labels:
-            continue
-        if all(workload_labels.get(k) == v for k, v in svc_labels.items()):
-            svc_type = svc_info.get("type", "ClusterIP")
-            if svc_type in ("NodePort", "LoadBalancer"):
-                for sp in svc_info.get("ports") or []:
-                    target = sp.get("targetPort", sp.get("port"))
-                    if isinstance(target, str):
-                        target = resolve_named_port(target, container_ports)
-                    node_port = sp.get("nodePort", sp.get("port"))
-                    if isinstance(node_port, str):
-                        node_port = resolve_named_port(node_port, container_ports)
-                    ports.append(f"{node_port}:{target}")
-    return ports
-
-
-def _build_aux_service(container: dict, pod_spec: dict, label: str,
-                       ctx: ConvertContext, base: dict,
-                       vcts: list | None = None) -> dict:
-    """Build a compose service dict for an init or sidecar container."""
-    svc = dict(base)
-    if container.get("image"):
-        svc["image"] = container["image"]
-    env_list = resolve_env(container, ctx.configmaps, ctx.secrets, label, ctx.warnings,
-                           replacements=ctx.replacements,
-                           service_port_map=ctx.service_port_map)
-    env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
-                for e in env_list}
-    svc.update(convert_command(container, env_dict))
-    if env_dict:
-        svc["environment"] = env_dict
-    volumes = convert_volume_mounts(
-        container.get("volumeMounts") or [], pod_spec.get("volumes") or [],
-        ctx.pvc_names, ctx.config, label, ctx.warnings,
-        configmaps=ctx.configmaps, secrets=ctx.secrets,
-        output_dir=ctx.output_dir, generated_cms=ctx.generated_cms,
-        generated_secrets=ctx.generated_secrets, replacements=ctx.replacements,
-        service_port_map=ctx.service_port_map,
-        volume_claim_templates=vcts)
-    if volumes:
-        svc["volumes"] = volumes
-    return svc
-
-
-def _convert_init_containers(pod_spec: dict, name: str, ctx: ConvertContext,
-                             vcts: list | None = None) -> dict:
-    """Convert init containers to separate compose services with restart: on-failure."""
-    result = {}
-    for ic in pod_spec.get("initContainers") or []:
-        ic_name = ic.get("name", "init")
-        ic_svc_name = f"{name}-init-{ic_name}"
-        if _is_excluded(ic_svc_name, ctx.config.get("exclude", [])):
-            continue
-        svc = _build_aux_service(ic, pod_spec, f"initContainer/{ic_svc_name}",
-                                 ctx, {"restart": "on-failure"}, vcts)
-        result[ic_svc_name] = svc
-    return result
-
-
-def _convert_sidecar_containers(pod_spec: dict, name: str, ctx: ConvertContext,
-                                 restart_policy: str = "always",
-                                 vcts: list | None = None) -> dict:
-    """Convert sidecar containers to compose services sharing the main service's network."""
-    result = {}
-    project = ctx.config.get("name", "")
-    cn = f"{project}-{name}" if project else name
-    for sc in (pod_spec.get("containers") or [])[1:]:
-        sc_name = sc.get("name", "sidecar")
-        sc_svc_name = f"{name}-sidecar-{sc_name}"
-        if _is_excluded(sc_svc_name, ctx.config.get("exclude", [])):
-            continue
-        base = {"restart": restart_policy, "network_mode": f"container:{cn}",
-                "depends_on": [name]}
-        svc = _build_aux_service(sc, pod_spec, f"sidecar/{sc_svc_name}",
-                                 ctx, base, vcts)
-        result[sc_svc_name] = svc
-    return result
-
-
 class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-methods  # contract: one class, one method
     """Convert DaemonSet, Deployment, Job, StatefulSet manifests to compose services."""
     name = "simple-workload"
     kinds = list(_WORKLOAD_KINDS)
     priority = 500
+
+    @staticmethod
+    def _probe_to_healthcheck(probe: dict, container_ports: list | None = None) -> dict | None:
+        """Convert a K8s probe to a Compose healthcheck dict."""
+        if not probe:
+            return None
+        hc = {}
+        if "exec" in probe:
+            cmd = (probe["exec"].get("command") or [])
+            if cmd:
+                hc["test"] = ["CMD"] + cmd
+        elif "httpGet" in probe:
+            http = probe["httpGet"]
+            port = http.get("port", 80)
+            if isinstance(port, str):
+                port = resolve_named_port(port, container_ports or [])
+            path = http.get("path", "/")
+            scheme = http.get("scheme", "HTTP").lower()
+            host = http.get("host", "localhost")
+            url = shlex.quote(f"{scheme}://{host}:{port}{path}")
+            hc["test"] = ["CMD", "sh", "-c",
+                           f"wget -qO /dev/null {url} || exit 1"]
+        elif "tcpSocket" in probe:
+            port = probe["tcpSocket"].get("port", 80)
+            if isinstance(port, str):
+                port = resolve_named_port(port, container_ports or [])
+            hc["test"] = ["CMD", "sh", "-c",
+                           f"cat < /dev/tcp/localhost/{port} || exit 1"]
+        else:
+            return None
+        if "periodSeconds" in probe:
+            hc["interval"] = f"{probe['periodSeconds']}s"
+        if "timeoutSeconds" in probe:
+            hc["timeout"] = f"{probe['timeoutSeconds']}s"
+        if "failureThreshold" in probe:
+            hc["retries"] = probe["failureThreshold"]
+        if "initialDelaySeconds" in probe:
+            hc["start_period"] = f"{probe['initialDelaySeconds']}s"
+        return hc
+
+    @staticmethod
+    def _k8s_cpu_to_compose(cpu: str) -> str:
+        """Convert K8s CPU quantity (e.g. '500m', '1', '0.5') to Compose cpus float string."""
+        cpu = str(cpu)
+        if cpu.endswith("m"):
+            return f"{int(cpu[:-1]) / 1000:.3g}"
+        return cpu
+
+    @staticmethod
+    def _k8s_mem_to_compose(mem: str) -> str:
+        """Convert K8s memory quantity (e.g. '256Mi', '1Gi') to Compose format ('256m', '1g')."""
+        mem = str(mem)
+        # K8s binary units → Compose lowercase (Ki→k, Mi→m, Gi→g, Ti→t)
+        for suffix in ("Ti", "Gi", "Mi", "Ki"):
+            if mem.endswith(suffix):
+                return mem[:-2] + suffix[0].lower()
+        return mem
+
+    @staticmethod
+    def _is_excluded(name: str, exclude_list: list[str]) -> bool:
+        """Check if a workload name matches any exclude pattern (supports wildcards)."""
+        return any(fnmatch.fnmatch(name, pattern) for pattern in exclude_list)
+
+    @staticmethod
+    def _get_exposed_ports(workload_labels: dict, container_ports: list,
+                           services_by_selector: dict) -> list[str]:
+        """Determine which ports to expose based on K8s Service type."""
+        ports = []
+        for _sel_key, svc_info in services_by_selector.items():
+            svc_labels = svc_info.get("selector") or {}
+            if not svc_labels:
+                continue
+            if all(workload_labels.get(k) == v for k, v in svc_labels.items()):
+                svc_type = svc_info.get("type", "ClusterIP")
+                if svc_type in ("NodePort", "LoadBalancer"):
+                    for sp in svc_info.get("ports") or []:
+                        target = sp.get("targetPort", sp.get("port"))
+                        if isinstance(target, str):
+                            target = resolve_named_port(target, container_ports)
+                        node_port = sp.get("nodePort", sp.get("port"))
+                        if isinstance(node_port, str):
+                            node_port = resolve_named_port(node_port, container_ports)
+                        ports.append(f"{node_port}:{target}")
+        return ports
+
+    @staticmethod
+    def _build_aux_service(container: dict, pod_spec: dict, label: str,
+                           ctx: ConvertContext, base: dict,
+                           vcts: list | None = None) -> dict:
+        """Build a compose service dict for an init or sidecar container."""
+        svc = dict(base)
+        if container.get("image"):
+            svc["image"] = container["image"]
+        env_list = resolve_env(container, ctx.configmaps, ctx.secrets, label, ctx.warnings,
+                               replacements=ctx.replacements,
+                               service_port_map=ctx.service_port_map)
+        env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
+                    for e in env_list}
+        svc.update(convert_command(container, env_dict))
+        if env_dict:
+            svc["environment"] = env_dict
+        volumes = convert_volume_mounts(
+            container.get("volumeMounts") or [], pod_spec.get("volumes") or [],
+            ctx.pvc_names, ctx.config, label, ctx.warnings,
+            configmaps=ctx.configmaps, secrets=ctx.secrets,
+            output_dir=ctx.output_dir, generated_cms=ctx.generated_cms,
+            generated_secrets=ctx.generated_secrets, replacements=ctx.replacements,
+            service_port_map=ctx.service_port_map,
+            volume_claim_templates=vcts)
+        if volumes:
+            svc["volumes"] = volumes
+        return svc
+
+    @staticmethod
+    def _convert_init_containers(pod_spec: dict, name: str, ctx: ConvertContext,
+                                 vcts: list | None = None) -> dict:
+        """Convert init containers to separate compose services with restart: on-failure."""
+        result = {}
+        for ic in pod_spec.get("initContainers") or []:
+            ic_name = ic.get("name", "init")
+            ic_svc_name = f"{name}-init-{ic_name}"
+            if SimpleWorkloadProvider._is_excluded(ic_svc_name, ctx.config.get("exclude", [])):
+                continue
+            svc = SimpleWorkloadProvider._build_aux_service(
+                ic, pod_spec, f"initContainer/{ic_svc_name}",
+                ctx, {"restart": "on-failure"}, vcts)
+            result[ic_svc_name] = svc
+        return result
+
+    @staticmethod
+    def _convert_sidecar_containers(pod_spec: dict, name: str, ctx: ConvertContext,
+                                    restart_policy: str = "always",
+                                    vcts: list | None = None) -> dict:
+        """Convert sidecar containers to compose services sharing the main service's network."""
+        result = {}
+        project = ctx.config.get("name", "")
+        cn = f"{project}-{name}" if project else name
+        for sc in (pod_spec.get("containers") or [])[1:]:
+            sc_name = sc.get("name", "sidecar")
+            sc_svc_name = f"{name}-sidecar-{sc_name}"
+            if SimpleWorkloadProvider._is_excluded(sc_svc_name, ctx.config.get("exclude", [])):
+                continue
+            base = {"restart": restart_policy, "network_mode": f"container:{cn}",
+                    "depends_on": [name]}
+            svc = SimpleWorkloadProvider._build_aux_service(sc, pod_spec, f"sidecar/{sc_svc_name}",
+                                                            ctx, base, vcts)
+            result[sc_svc_name] = svc
+        return result
 
     def convert(self, kind: str, manifests: list[dict], ctx: ConvertContext) -> ProviderResult:
         """Convert all manifests of the given workload kind."""
@@ -190,7 +191,7 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
         name = meta.get("name", "unknown")
         full = f"{manifest.get('kind', '?')}/{name}"
 
-        if _is_excluded(name, ctx.config.get("exclude", [])):
+        if self._is_excluded(name, ctx.config.get("exclude", [])):
             return None
 
         # Skip workloads scaled to zero (e.g. disabled AI services)
@@ -211,7 +212,7 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
             ctx.warnings.append(f"{full} has no containers — skipped")
             return None
 
-        result = _convert_init_containers(pod_spec, name, ctx, vcts=vcts)
+        result = self._convert_init_containers(pod_spec, name, ctx, vcts=vcts)
         svc = self._build_service(containers[0], pod_spec, meta, full,
                                   ctx, restart_policy, vcts)
         init_names = [k for k in result]
@@ -224,7 +225,7 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
             project = ctx.config.get("name", "")
             cn = f"{project}-{name}" if project else name
             svc["container_name"] = cn
-            sidecar_result = _convert_sidecar_containers(
+            sidecar_result = self._convert_sidecar_containers(
                 pod_spec, name, ctx, restart_policy=restart_policy, vcts=vcts)
             result.update(sidecar_result)
 
@@ -252,9 +253,10 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
             svc["environment"] = env_dict
 
         # Ports
-        exposed_ports = _get_exposed_ports(meta.get("labels") or {},
-                                           container.get("ports") or [],
-                                           ctx.services_by_selector)
+        exposed_ports = SimpleWorkloadProvider._get_exposed_ports(
+            meta.get("labels") or {},
+            container.get("ports") or [],
+            ctx.services_by_selector)
         if exposed_ports:
             svc["ports"] = exposed_ports
 
@@ -273,16 +275,16 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
 
         # Healthcheck from probes (readiness preferred, fallback to liveness)
         probe = container.get("readinessProbe") or container.get("livenessProbe")
-        hc = _probe_to_healthcheck(probe, container.get("ports") or [])
+        hc = SimpleWorkloadProvider._probe_to_healthcheck(probe, container.get("ports") or [])
         if hc:
             svc["healthcheck"] = hc
 
         limits = (container.get("resources") or {}).get("limits") or {}
         deploy_limits = {}
         if "memory" in limits:
-            deploy_limits["memory"] = _k8s_mem_to_compose(limits["memory"])
+            deploy_limits["memory"] = SimpleWorkloadProvider._k8s_mem_to_compose(limits["memory"])
         if "cpu" in limits:
-            deploy_limits["cpus"] = _k8s_cpu_to_compose(limits["cpu"])
+            deploy_limits["cpus"] = SimpleWorkloadProvider._k8s_cpu_to_compose(limits["cpu"])
         if deploy_limits:
             svc["deploy"] = {"resources": {"limits": deploy_limits}}
 
