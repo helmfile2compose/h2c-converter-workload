@@ -14,7 +14,7 @@ from dekube import (  # pylint: disable=import-error  # h2c resolves at runtime
 _WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "StatefulSet")
 
 
-def _probe_to_healthcheck(probe: dict) -> dict | None:
+def _probe_to_healthcheck(probe: dict, container_ports: list | None = None) -> dict | None:
     """Convert a K8s probe to a Compose healthcheck dict."""
     if not probe:
         return None
@@ -26,6 +26,8 @@ def _probe_to_healthcheck(probe: dict) -> dict | None:
     elif "httpGet" in probe:
         http = probe["httpGet"]
         port = http.get("port", 80)
+        if isinstance(port, str):
+            port = resolve_named_port(port, container_ports or [])
         path = http.get("path", "/")
         scheme = http.get("scheme", "HTTP").lower()
         host = http.get("host", "localhost")
@@ -33,7 +35,9 @@ def _probe_to_healthcheck(probe: dict) -> dict | None:
         hc["test"] = ["CMD", "sh", "-c",
                        f"wget -qO /dev/null {url} || exit 1"]
     elif "tcpSocket" in probe:
-        port = int(probe["tcpSocket"].get("port", 80))
+        port = probe["tcpSocket"].get("port", 80)
+        if isinstance(port, str):
+            port = resolve_named_port(port, container_ports or [])
         hc["test"] = ["CMD", "sh", "-c",
                        f"cat < /dev/tcp/localhost/{port} || exit 1"]
     else:
@@ -249,7 +253,7 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
 
         # Healthcheck from probes (readiness preferred, fallback to liveness)
         probe = container.get("readinessProbe") or container.get("livenessProbe")
-        hc = _probe_to_healthcheck(probe)
+        hc = _probe_to_healthcheck(probe, container.get("ports") or [])
         if hc:
             svc["healthcheck"] = hc
 
