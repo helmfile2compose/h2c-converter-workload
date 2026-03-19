@@ -11,7 +11,7 @@ from dekube import (  # pylint: disable=import-error  # h2c resolves at runtime
     resolve_named_port,
 )
 
-_WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "StatefulSet")
+_WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "Pod", "StatefulSet")
 
 
 def _probe_to_healthcheck(probe: dict, container_ports: list | None = None) -> dict | None:
@@ -170,8 +170,14 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
     def convert(self, kind: str, manifests: list[dict], ctx: ConvertContext) -> ProviderResult:
         """Convert all manifests of the given workload kind."""
         services = {}
-        restart = "on-failure" if kind == "Job" else "always"
+        default_restart = "on-failure" if kind == "Job" else "always"
         for m in manifests:
+            # Pod: read restartPolicy from spec (K8s default: Always)
+            if kind == "Pod":
+                k8s_policy = (m.get("spec") or {}).get("restartPolicy", "Always")
+                restart = {"Always": "always", "OnFailure": "on-failure", "Never": "no"}.get(k8s_policy, "always")
+            else:
+                restart = default_restart
             result = self._convert_one(m, ctx, restart_policy=restart)
             if result:
                 services.update(result)
@@ -194,7 +200,11 @@ class SimpleWorkloadProvider(Provider):  # pylint: disable=too-few-public-method
             return None
 
         spec = manifest.get("spec") or {}
-        pod_spec = (spec.get("template") or {}).get("spec") or {}
+        kind = manifest.get("kind", "")
+        if kind == "Pod":
+            pod_spec = spec
+        else:
+            pod_spec = (spec.get("template") or {}).get("spec") or {}
         vcts = spec.get("volumeClaimTemplates")  # StatefulSet only
         containers = pod_spec.get("containers") or []
         if not containers:
